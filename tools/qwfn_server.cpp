@@ -1802,13 +1802,25 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        const auto reset_restored_slot = [&]() {
+            S.eng.reset();
+            S.eng.clear_embeddings();
+            S.consumed.clear(); S.consumed_img.clear();
+            S.last_gen.clear(); S.last_prompt.clear(); S.last_msgs = json();
+            S.last_content.clear(); S.last_reasoning.clear(); S.last_tool_key.clear();
+            std::lock_guard<std::mutex> live_lk(S.live.mu);
+            S.live.n_past = S.eng.n_past();
+        };
+
         if (S.eng.mtp_loaded()) {
+            reset_restored_slot();
             fail(res, 409, "durable snapshots do not support MTP in format v1");
             return;
         }
         std::error_code file_ec;
         const auto file_status = std::filesystem::symlink_status(path, file_ec);
         if (file_ec || !std::filesystem::is_regular_file(file_status)) {
+            reset_restored_slot();
             fail(res, 404, "snapshot file does not exist");
             return;
         }
@@ -1822,13 +1834,13 @@ int main(int argc, char ** argv) {
             // A restore can fail after partial device copies (for example, a file
             // changed between validation and apply). Clear both halves of the
             // slot so no stale server metadata can make that state reusable.
-            S.eng.reset();
-            S.eng.clear_embeddings();
-            S.consumed.clear(); S.consumed_img.clear();
-            S.last_gen.clear(); S.last_prompt.clear(); S.last_msgs = json();
-            S.last_content.clear(); S.last_reasoning.clear(); S.last_tool_key.clear();
+            reset_restored_slot();
             const int status = snapshot_err.find("incompatible") != std::string::npos ? 409 :
-                               snapshot_err.find("invalid") != std::string::npos || snapshot_err.find("unsupported") != std::string::npos ? 422 : 500;
+                               snapshot_err.find("invalid") != std::string::npos ||
+                               snapshot_err.find("unsupported") != std::string::npos ||
+                               snapshot_err.find("checksum") != std::string::npos ||
+                               snapshot_err.find("truncated") != std::string::npos ||
+                               snapshot_err.find("mismatch") != std::string::npos ? 422 : 500;
             fail(res, status, snapshot_err);
             return;
         }
@@ -1841,6 +1853,7 @@ int main(int argc, char ** argv) {
         S.last_reasoning = std::move(restored.last_reasoning);
         S.last_tool_key = std::move(restored.last_tool_key);
         S.last_thinking = restored.last_thinking;
+        { std::lock_guard<std::mutex> live_lk(S.live.mu); S.live.n_past = S.eng.n_past(); }
         res.set_content(json{{"id_slot", 0}, {"filename", filename},
                              {"n_restored", S.consumed.size()}, {"bytes", snapshot_bytes}}.dump(), "application/json");
     });
