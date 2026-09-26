@@ -80,6 +80,8 @@ add_library(qwfn_core STATIC
   src/qwfn_graph.cpp
   src/qwfn_state.cpp
   src/qwfn_engine.cpp
+  src/qwfn_engine_snapshot.cpp
+  src/qwfn_snapshot.cpp
   src/qwfn_prefill.cpp
   src/qwfn_vision.cpp
 )

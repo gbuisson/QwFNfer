@@ -288,6 +288,27 @@ public:
     int32_t n_past() const { return n_past_; }
     int64_t n_vocab() const { return n_vocab_; }
 
+    // Durable, single-sequence snapshots. `server_state` is an opaque metadata
+    // blob owned by qwfn-server; it travels in the same integrity envelope as
+    // the engine tensors. Restore validates the entire archive and calls
+    // validate_metadata before mutating device state. MTP snapshots are rejected
+    // in v1 rather than silently dropping speculative state.
+    using snapshot_metadata_validator = std::function<bool(
+        const std::vector<int32_t> & tokens,
+        const std::string & server_state,
+        std::string & err)>;
+    bool save_snapshot(const std::string & path,
+                       const std::vector<int32_t> & tokens,
+                       const std::string & server_state,
+                       uint64_t & bytes_written,
+                       std::string & err) const;
+    bool restore_snapshot(const std::string & path,
+                          const snapshot_metadata_validator & validate_metadata,
+                          std::vector<int32_t> & tokens,
+                          std::string & server_state,
+                          uint64_t & bytes_read,
+                          std::string & err);
+
     // The vision tower shares the language model's backend and buffer type.
     ggml_backend_t             backend() const { return w_.backend(); }
     ggml_backend_buffer_type_t buft()    const { return w_.buft(); }
@@ -372,8 +393,10 @@ private:
     int32_t max_ubatch(int32_t n_past) const;
     void build_qsa_inputs(int64_t n_kv, int64_t T, uint32_t ratio);
     void run_on(ggml_cgraph * gf, bool gpu);
+    std::vector<uint8_t> snapshot_compatibility() const;
 
     const model_index * mi_ = nullptr;
+    const model_index * mi_cold_ = nullptr;
     engine_config       cfg_;
     int                 n_threads_ = 8;
     hparams             hp_;

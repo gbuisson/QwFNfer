@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -650,6 +651,7 @@ struct server {
     bool                 last_thinking = true;
     std::string          model_id = "qwen3.8-flash-next";
     std::string          model_file;   // the shard the server was started with, for /props
+    std::string          snapshot_dir; // empty disables durable /slots/0 save/restore
     uint32_t             n_ctx = 0, n_batch = 0;
 
     // Live-adjustable defaults (GET/POST /props) and the live counter.
@@ -668,6 +670,111 @@ struct server {
     };
 
 };
+
+struct restored_server_state {
+    std::unordered_map<int32_t, uint64_t> consumed_img;
+    std::vector<int32_t> last_gen;
+    std::vector<int32_t> last_prompt;
+    json last_msgs;
+    std::string last_content, last_reasoning, last_tool_key;
+    bool last_thinking = true;
+};
+
+static std::string snapshot_server_state(const server & S) {
+    json images = json::array();
+    std::vector<std::pair<int32_t, uint64_t>> sorted_images(S.consumed_img.begin(), S.consumed_img.end());
+    std::sort(sorted_images.begin(), sorted_images.end());
+    for (const auto & [position, hash] : sorted_images)
+        images.push_back(json{{"position", position}, {"hash", hash}});
+    return json_dump(json{
+        {"version", 1}, {"consumed_images", images},
+        {"last_gen", S.last_gen}, {"last_prompt", S.last_prompt}, {"last_msgs", S.last_msgs},
+        {"last_content", S.last_content}, {"last_reasoning", S.last_reasoning},
+        {"last_tool_key", S.last_tool_key}, {"last_thinking", S.last_thinking},
+    });
+}
+
+static bool parse_snapshot_server_state(const std::vector<int32_t> & consumed,
+                                        const std::string & blob,
+                                        restored_server_state & out,
+                                        std::string & err) {
+    try {
+        const json j = json::parse(blob);
+        if (!j.is_object() || j.value("version", 0) != 1) {
+            err = "snapshot server metadata has an unsupported version";
+            return false;
+        }
+        for (const char * name : {"last_gen", "last_prompt"})
+            if (!j.contains(name) || !j[name].is_array()) {
+                err = std::string("snapshot server metadata is missing ") + name;
+                return false;
+            }
+        out.last_gen = j["last_gen"].get<std::vector<int32_t>>();
+        out.last_prompt = j["last_prompt"].get<std::vector<int32_t>>();
+        out.last_msgs = j.contains("last_msgs") ? j["last_msgs"] : json();
+        if (!out.last_msgs.is_null() && !out.last_msgs.is_array()) {
+            err = "snapshot last_msgs is neither null nor an array";
+            return false;
+        }
+        for (const char * name : {"last_content", "last_reasoning", "last_tool_key"})
+            if (!j.contains(name) || !j[name].is_string()) {
+                err = std::string("snapshot server metadata is missing ") + name;
+                return false;
+            }
+        if (!j.contains("last_thinking") || !j["last_thinking"].is_boolean()) {
+            err = "snapshot server metadata is missing last_thinking";
+            return false;
+        }
+        out.last_content = j["last_content"].get<std::string>();
+        out.last_reasoning = j["last_reasoning"].get<std::string>();
+        out.last_tool_key = j["last_tool_key"].get<std::string>();
+        out.last_thinking = j["last_thinking"].get<bool>();
+
+        if (out.last_prompt.size() > consumed.size() ||
+            !std::equal(out.last_prompt.begin(), out.last_prompt.end(), consumed.begin())) {
+            err = "snapshot last_prompt is not a prefix of consumed tokens";
+            return false;
+        }
+        const size_t tail = consumed.size() - out.last_prompt.size();
+        if (tail > out.last_gen.size() ||
+            !std::equal(consumed.begin() + out.last_prompt.size(), consumed.end(), out.last_gen.begin())) {
+            err = "snapshot last_gen does not continue consumed tokens";
+            return false;
+        }
+
+        out.consumed_img.clear();
+        const json images = j.value("consumed_images", json::array());
+        if (!images.is_array()) {
+            err = "snapshot consumed_images is not an array";
+            return false;
+        }
+        for (const auto & image : images) {
+            if (!image.is_object() || !image.contains("position") || !image["position"].is_number_integer() ||
+                !image.contains("hash") || !image["hash"].is_number_unsigned()) {
+                err = "snapshot contains an invalid consumed image entry";
+                return false;
+            }
+            const int32_t position = image["position"].get<int32_t>();
+            if (position < 0 || static_cast<size_t>(position) >= consumed.size() ||
+                !out.consumed_img.emplace(position, image["hash"].get<uint64_t>()).second) {
+                err = "snapshot contains an invalid or duplicate image position";
+                return false;
+            }
+        }
+        return true;
+    } catch (const std::exception & ex) {
+        err = std::string("invalid snapshot server metadata: ") + ex.what();
+        return false;
+    }
+}
+
+static bool safe_snapshot_filename(const std::string & filename) {
+    if (filename.empty() || filename.size() > 255 || filename == "." || filename == "..") return false;
+    return std::all_of(filename.begin(), filename.end(), [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+    });
+}
 
 static bool render_content(server & S, const json & content, std::string & text,
                            std::vector<std::pair<size_t, pending_img>> & imgs,
@@ -888,6 +995,7 @@ int main(int argc, char ** argv) {
           "      --state-host V  attention state in pinned host memory: none (default) | idx | kv,idx. The VRAM it held goes to\n"
           "                      the expert tier; costs ~0.35 ms/token (idx) or ~2 ms/token (kv,idx) of PCIe reads\n"
           "      --alias NAME    model id reported by /v1/models\n"
+          "      --snapshot-dir DIR  enable durable /slots/0 save/restore under this directory (v1: no MTP)\n"
           "      --think LEVEL   default reasoning effort: xhigh|medium|low|off\n"
           "      --think-budget N  max reasoning tokens per answer (0 = unlimited); also POST /props {\"reasoning_budget\":N} or per request\n"
           "      --ctx N         context (default 32768)   --batch N (default 2048)\n"
@@ -907,7 +1015,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::string host = "127.0.0.1", mmproj_path, alias, def_effort = "xhigh";
+    std::string host = "127.0.0.1", mmproj_path, alias, snapshot_dir, def_effort = "xhigh";
     int vision_threads = 0;
     int def_reasoning_budget = 0;
     int port = 8080;
@@ -926,6 +1034,7 @@ int main(int argc, char ** argv) {
         if (a == "--mmproj" && i + 1 < argc) { mmproj_path = next(); continue; }
         if (a == "--vision-threads" && i + 1 < argc) { vision_threads = atoi(next()); continue; }
         if (a == "--alias"  && i + 1 < argc) { alias = next(); continue; }
+        if (a == "--snapshot-dir" && i + 1 < argc) { snapshot_dir = next(); continue; }
         if (a == "--think"  && i + 1 < argc) { def_effort = next(); continue; }
         if (a == "--think-budget" && i + 1 < argc) { def_reasoning_budget = atoi(next()); continue; }
         if (a == "--ctx"    && i + 1 < argc) { cfg.n_ctx = (uint32_t) atoi(next()); continue; }
@@ -974,11 +1083,25 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (!effort_valid(def_effort)) { fprintf(stderr, "--think must be xhigh|medium|low|off\n"); return 1; }
+    if (!snapshot_dir.empty() && !cfg.mtp_path.empty()) {
+        fprintf(stderr, "--snapshot-dir is incompatible with --mtp in snapshot format v1\n");
+        return 1;
+    }
 
     server S;
     S.n_ctx = cfg.n_ctx; S.n_batch = cfg.n_batch; S.mtp_drafts = cfg.mtp_drafts; S.def_effort = def_effort; S.def_reasoning_budget = def_reasoning_budget;
     S.model_file = argv[1];
     std::string err;
+    if (!snapshot_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(snapshot_dir, ec);
+        if (ec) { fprintf(stderr, "snapshot directory: %s\n", ec.message().c_str()); return 1; }
+        S.snapshot_dir = std::filesystem::weakly_canonical(snapshot_dir, ec).string();
+        if (ec || S.snapshot_dir.empty() || chmod(S.snapshot_dir.c_str(), 0700) != 0) {
+            fprintf(stderr, "snapshot directory is not usable: %s\n", ec ? ec.message().c_str() : strerror(errno));
+            return 1;
+        }
+    }
 
     fprintf(stderr, "loading tokenizer...\n");
     if (!S.vb.load(argv[1], err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
@@ -1622,9 +1745,104 @@ int main(int argc, char ** argv) {
         json st = stats_json();
         res.set_content(json::array({ json{
             {"id", 0}, {"id_task", -1}, {"is_processing", st["busy"]},
-            {"n_ctx", S.n_ctx}, {"n_past", st["context"]["n_past"]},
+            {"n_ctx", S.n_ctx}, {"n_past", st["context"]["n_past"]}, {"n_prompt_tokens", st["context"]["n_past"]},
             {"model", S.model_id}, {"params", props_json()["default_generation_settings"]},
             {"next_token", {{"n_decoded", st["generation"]["n"]}}}} }).dump(2, ' ', false, json::error_handler_t::replace), "application/json");
+    });
+    svr.Post(R"(/slots/(\d+))", [&](const httplib::Request & req, httplib::Response & res) {
+        if (req.matches.size() < 2 || req.matches[1] != "0") {
+            fail(res, 404, "only slot 0 exists");
+            return;
+        }
+        if (S.snapshot_dir.empty()) {
+            fail(res, 501, "durable snapshots are disabled; start with --snapshot-dir");
+            return;
+        }
+        if (!req.has_param("action")) {
+            fail(res, 400, "missing slot action");
+            return;
+        }
+        const std::string action = req.get_param_value("action");
+        if (action != "save" && action != "restore") {
+            fail(res, 400, "slot action must be save or restore");
+            return;
+        }
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception & ex) { fail(res, 400, std::string("bad JSON: ") + ex.what()); return; }
+        if (!body.is_object() || !body.contains("filename") || !body["filename"].is_string()) {
+            fail(res, 400, "filename must be a string");
+            return;
+        }
+        const std::string filename = body["filename"].get<std::string>();
+        if (!safe_snapshot_filename(filename)) {
+            fail(res, 400, "invalid snapshot filename");
+            return;
+        }
+        const std::string path = (std::filesystem::path(S.snapshot_dir) / filename).string();
+        std::lock_guard<std::mutex> lk(S.mu);
+        std::string snapshot_err;
+        uint64_t snapshot_bytes = 0;
+        if (action == "save") {
+            if (S.consumed.empty() || static_cast<int32_t>(S.consumed.size()) != S.eng.n_past()) {
+                fail(res, 409, "slot 0 has no internally consistent state to save");
+                return;
+            }
+            if (S.eng.mtp_loaded()) {
+                fail(res, 409, "durable snapshots do not support MTP in format v1");
+                return;
+            }
+            if (!S.eng.save_snapshot(path, S.consumed, snapshot_server_state(S), snapshot_bytes, snapshot_err)) {
+                const int status = snapshot_err.find("token count") != std::string::npos ? 409 : 500;
+                fail(res, status, snapshot_err);
+                return;
+            }
+            res.set_content(json{{"id_slot", 0}, {"filename", filename},
+                                 {"n_saved", S.consumed.size()}, {"bytes", snapshot_bytes}}.dump(), "application/json");
+            return;
+        }
+
+        if (S.eng.mtp_loaded()) {
+            fail(res, 409, "durable snapshots do not support MTP in format v1");
+            return;
+        }
+        std::error_code file_ec;
+        const auto file_status = std::filesystem::symlink_status(path, file_ec);
+        if (file_ec || !std::filesystem::is_regular_file(file_status)) {
+            fail(res, 404, "snapshot file does not exist");
+            return;
+        }
+        restored_server_state restored;
+        std::vector<int32_t> restored_tokens;
+        std::string restored_blob;
+        const auto validate = [&](const std::vector<int32_t> & tokens, const std::string & blob, std::string & parse_err) {
+            return parse_snapshot_server_state(tokens, blob, restored, parse_err);
+        };
+        if (!S.eng.restore_snapshot(path, validate, restored_tokens, restored_blob, snapshot_bytes, snapshot_err)) {
+            // A restore can fail after partial device copies (for example, a file
+            // changed between validation and apply). Clear both halves of the
+            // slot so no stale server metadata can make that state reusable.
+            S.eng.reset();
+            S.eng.clear_embeddings();
+            S.consumed.clear(); S.consumed_img.clear();
+            S.last_gen.clear(); S.last_prompt.clear(); S.last_msgs = json();
+            S.last_content.clear(); S.last_reasoning.clear(); S.last_tool_key.clear();
+            const int status = snapshot_err.find("incompatible") != std::string::npos ? 409 :
+                               snapshot_err.find("invalid") != std::string::npos || snapshot_err.find("unsupported") != std::string::npos ? 422 : 500;
+            fail(res, status, snapshot_err);
+            return;
+        }
+        S.consumed = std::move(restored_tokens);
+        S.consumed_img = std::move(restored.consumed_img);
+        S.last_gen = std::move(restored.last_gen);
+        S.last_prompt = std::move(restored.last_prompt);
+        S.last_msgs = std::move(restored.last_msgs);
+        S.last_content = std::move(restored.last_content);
+        S.last_reasoning = std::move(restored.last_reasoning);
+        S.last_tool_key = std::move(restored.last_tool_key);
+        S.last_thinking = restored.last_thinking;
+        res.set_content(json{{"id_slot", 0}, {"filename", filename},
+                             {"n_restored", S.consumed.size()}, {"bytes", snapshot_bytes}}.dump(), "application/json");
     });
     svr.Get("/metrics", [&](const httplib::Request &, httplib::Response & res) {
         json st = stats_json();

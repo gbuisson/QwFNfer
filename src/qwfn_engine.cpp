@@ -81,6 +81,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
                   const engine_config & cfg, const std::string & backend_dir, std::string & err) {
     ggml_log_set(qwfn_ggml_log, nullptr);
     mi_  = hot;
+    mi_cold_ = cold;
     cfg_ = cfg;
     hp_  = hot->hp();
     n_vocab_ = hp_.n_vocab;
