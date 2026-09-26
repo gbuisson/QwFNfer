@@ -188,3 +188,23 @@ Before production merge:
 The acceptance criterion is not merely a successful restore response: alternating
 sessions must stop doing full historical prefill while exact-extension checks
 continue to reset on any divergent prompt.
+
+## Live CUDA validation
+
+Validated on an RTX 4080 with CUDA 12.9, the 192K Qwen3.8-Flash-Next
+UD-Q4_K_XL model, QwFNfer `00af479`, and `local-llm-kv-cache` `0a82133`.
+The controlled sequence alternated two independent 7.1K-token sessions A/B/A:
+
+- direct backend control: A2 performed a full prefill (`cached_tokens=0`) in
+  20.588 s;
+- snapshot proxy: A2 restored 7,137 tokens and completed in 6.551 s, a 3.14x
+  speedup (68.2% lower latency); the measured restore itself took 2.666 s;
+- direct and restored continuations both produced the exact expected `FINAL-A`
+  response;
+- session archives were 233 MB, mode `0600`, and saved atomically on the shared
+  snapshot volume;
+- a divergent prompt under the same affinity key reported `cached_tokens=0`;
+- a checksum-corrupt archive returned `422` and reset `/slots/0` to `n_past=0`;
+- a missing restore target returned `404` and likewise left `n_past=0`;
+- the deployed Hermes `gaming-qwfnfer` provider supplied its opaque session ID
+  in the request body and produced a durable session snapshot.
