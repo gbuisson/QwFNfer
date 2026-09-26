@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(qwfnfer LANGUAGES C CXX)
 
+include(CTest)
+
 # qwfnfer -- a purpose-built inference engine for Qwen3.8-Flash-Next (GGUF arch "qwen4exp").
 #
 # We own the model graph and the memory hierarchy; ggml supplies the quantized
@@ -90,6 +92,19 @@ target_include_directories(qwfn_core PUBLIC
 )
 target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads "${URING_LIBRARY}")
 target_compile_options(qwfn_core PRIVATE -O3 ${QWFN_ARCH_FLAGS} -Wall -Wextra -Wno-unused-parameter)
+
+# The archive codec intentionally has no ggml/liburing dependency, so its
+# corruption and atomic-write tests also run on development hosts without the
+# inference toolchain.
+add_executable(qwfn-snapshot-test
+  tools/qwfn_snapshot_test.cpp
+  src/qwfn_snapshot.cpp
+)
+target_include_directories(qwfn-snapshot-test PRIVATE src)
+target_compile_options(qwfn-snapshot-test PRIVATE -Wall -Wextra)
+if(BUILD_TESTING)
+  add_test(NAME qwfn-snapshot-codec COMMAND qwfn-snapshot-test)
+endif()
 
 add_executable(qwfn-iobench tools/qwfn_iobench.cpp)
 target_link_libraries(qwfn-iobench PRIVATE qwfn_core)
